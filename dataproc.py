@@ -53,7 +53,7 @@ def update_person_box(prev:dict, newly:list)-> dict:
             new_index[idx] = prev[idx]
     return new_index
 
-def get_boxes_on_frames(keypoints_info:list) -> dict:
+def get_tracked_boxes_on_frames(keypoints_info:list) -> dict:
     """ Возвращает все рамки по кадрам в форме словаря.
         Args:
             keypoints_info, list - из аннотаций после alphapose детектора ключевых точек позы
@@ -150,7 +150,7 @@ def parse_crowd_exercise(json_ann_path:str, track2student:dict)-> dict:
     """
     with open(json_ann_path, "r") as res_file:
         kps_info = json.load(res_file)
-    frame2boxes = get_boxes_on_frames(kps_info)
+    frame2boxes = get_tracked_boxes_on_frames(kps_info)
     # autotracked id to student id
     json_entry_count = 0
     for fid in frame2boxes:
@@ -175,7 +175,43 @@ def parse_crowd_exercise(json_ann_path:str, track2student:dict)-> dict:
                 entry["idx"] = student_id
     # get keypoints as array in dictionary by student id
     return get_keypoints_by_student(set(track2student.values()), kps_info)
-    
+
+def parse_single_person_exercise(json_ann_path:str, pick_tracked_id:int=0)->np.ndarray:
+    """ Парсит аннотацию видео одного человека в массив ndarray.
+        Args:
+            json_ann_path, str - путь до аннотации
+            pick_tracked_id, int, optional - человека по какому id после отслеживания парсить, default=0
+        Returns:
+            numpy.ndarray ключевых точек из аннотации
+    """
+    with open(json_ann_path, "r") as res_file:
+        kps_info = json.load(res_file)
+    frame2boxes = get_tracked_boxes_on_frames(kps_info)
+    json_entry_count = 0
+    person_entries = []
+    for fid in frame2boxes:
+        boxes = frame2boxes[fid]
+        frame_entries = []
+        while json_entry_count < len(kps_info) and kps_info[json_entry_count]["image_id"] == fid:
+            frame_entries.append(kps_info[json_entry_count])
+            json_entry_count += 1 
+        for entry in frame_entries: 
+            for det_id in boxes:
+                if det_id == pick_tracked_id:
+                    box = boxes[det_id]            
+                    entbox = entry["box"]
+                    if entbox[0] != box[0]: break # bad coding
+                    if entbox[1] != box[1]: break
+                    if entbox[2] != box[2]: break
+                    if entbox[3] != box[3]: break
+                    entry["idx"] = pick_tracked_id
+                    person_entries.append(entry)
+                else:
+                    continue
+    one_student_dict = get_keypoints_by_student({pick_tracked_id}, person_entries)
+    # return 1 array of points of 1 person
+    return one_student_dict[pick_tracked_id]        
+
 def get_error_codes(annotations:dict, mistakes_dict:dict, correct_code:int=0)->dict:
     """ Возвращает словарь student_id:mistakes. 
         Значение - список списков с кодом ошибки для каждой попытки упражнения.
