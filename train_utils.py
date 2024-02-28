@@ -4,7 +4,28 @@ import torch
 import numpy as np
 import random
 
-def parse_annotations(file2mapping, single_st_ann, annotations_map, ss_vid_ann, single_student_tids):
+def parse_annotations(file2mapping:dict, single_st_ann:str, annotations_map:dict, ss_vid_ann:list, single_student_tids:dict, file2exercise:dict):
+    """ Парсит все ручные аннотации с ошибками и окончанием вместе с автоматически полученными аннотациями 
+        координат ключевых точек, собирая всё в словари с раздельными попытками упражнений в виде массивов.
+        Args:
+            file2mapping, dict[str, dict[int, int]] - путь до файла с детектированными координатами к. точек (ключ) 
+                : словарь автоопределенных id при трекинге человека вручную проставленным id в аннотациях ошибок и границ упражнений (значение)
+            single_st_ann, str - путь до файла с аннотациями ошибок и границ упражнений видео с одним учеником
+            annotations_map, dict[str, str] - путь до json-файлов с координатами точек к пути до ручных аннотаций ошибок и границ упражнений
+            ss_vid_ann, list - список путей до json-файлов с координатами ключевых точек, полученных от видео с одним учеником
+            single_student_tids, dict[str, int] - номер из видео с одним человеком (ключ) к id от автотрекинга человека(значение)
+            file2exercise, dict[str, str] - путь до файла с детектированными координатами к. точек(ключ) к названию упражнения(значение)
+
+        file2mapping.keys()==annotations_map.keys()==file2exercise.keys()
+
+        Returns:
+            (idx2error, exercise2points, exercise2errors)
+            idx2error, dict[int, str] - маппинг код ошибки к её названию
+            exercise2points, dict[str, dict[int, list[np.ndarrays]]] - имя упражнения 
+                к словарю с id ученика в качестве ключа со списком его попыток этого упражнения в качестве значения
+            exercise2errors, dict[str, dict[int, list[list[int]]]] - имя упражнения к словарю (id ученика:список ошибок к каждой его попытке)
+            Длина списков-значений в exercise2points и exercise2errors одинакова.
+    """
     #crowd
     exercise2points = dict()
     exercise2errors = dict()
@@ -18,26 +39,41 @@ def parse_annotations(file2mapping, single_st_ann, annotations_map, ss_vid_ann, 
                 for personid in people:
                     intkey = int(personid)
                     ann[k][intkey] = ann[k][personid]            
-        exname = os.path.basename(filename).split('.')[0]
+        exname = file2exercise[filename] #os.path.basename(filename).split('.')[0]
         student_tries = split_student_tries(sid2kps, ann['people_exercise_frames'])
         errs = get_error_codes(ann, encoded_errors)
         exercise2points[exname] = student_tries
         exercise2errors[exname] = errs
     #single student
-    student2points = dict()
-    #student2errors = dict()
     with open(single_st_ann, "r", encoding="utf8") as common_ann_file:
         common_ann = json.load(common_ann_file)
-    # ss_vid_ann = [os.path.join("../alphapose_res", f) for f in ["0756_alpha.json", "0912_alpha.json",
-    #                                                             "1043_alpha.json", "1156_alpha.json", 
-    #                                                             "1237_alpha.json"]]
+    student2errors = get_error_codes(common_ann, encoded_errors)
     for filename in ss_vid_ann:
         stud_id = os.path.split(filename)[-1][:4]
         dynamic = parse_single_person_exercise(filename, single_student_tids[stud_id])
         internal_vid_id = common_ann["file2id"][stud_id]
         student_tries = split_student_tries({internal_vid_id:dynamic}, common_ann['people_exercise_frames'])
-        student2points[internal_vid_id] = student_tries[internal_vid_id]
-    student2errors = get_error_codes(common_ann, encoded_errors)
+        stud_exercs_names = common_ann["exercise_names"][internal_vid_id]
+        stud_errs = student2errors[internal_vid_id]
+        exercise_ids = {en:(max(exercise2points[en])+1) for en in exercise2points}
+        for i, ename in enumerate(stud_exercs_names):        
+            if ename in exercise2points:
+                new_stud_code = exercise_ids[ename]
+                if new_stud_code not in exercise2points[ename]:
+                    exercise2points[ename][new_stud_code] = []
+                    exercise2errors[ename][new_stud_code] = []
+                exercise2points[ename][new_stud_code].append(student_tries[internal_vid_id][i])
+                # errors update
+                exercise2errors[ename][new_stud_code].append(stud_errs[i])
+            else:
+                exercise_ids[ename] = int(internal_vid_id)
+                exercise2points[ename] = dict()
+                exercise2points[ename][exercise_ids[ename]] = []
+                exercise2points[ename][exercise_ids[ename]].append(student_tries[internal_vid_id][i])            
+                # errors update
+                exercise2errors[ename] = dict()
+                exercise2errors[ename][exercise_ids[ename]] = []
+                exercise2errors[ename][exercise_ids[ename]].append(stud_errs[i])
     #cleaning
     delete_keys = []
     for ename in exercise2errors:
@@ -52,8 +88,6 @@ def parse_annotations(file2mapping, single_st_ann, annotations_map, ss_vid_ann, 
     for n in encoded_errors:
         idx = encoded_errors[n]
         idx2error[idx] = n
-    exercise2points["single_student"] = student2points
-    exercise2errors["single_student"] = student2errors
     return idx2error, exercise2points, exercise2errors
 
 def encode_label_tensor(label:list, class_count:int):
@@ -87,6 +121,21 @@ def normalize01(img_array:np.ndarray)->np.ndarray:
         charr = res[:, :, channel]
         res[:, :, channel] = (charr - charr.min()) / (charr.max() - charr.min())
     return res
+
+# augmentations
+def mirror_coordinate(coords:np.ndarray, coord_idx:int=0):
+    """ Принимает, что координата должна быть в основном в 0...1, но может быть >1 и <0.
+        Отражает относительно 0.5, меняется только в 3 размерности (coords.shape[2]), как цветовой канал. 
+        Не для нормализованных данных!
+        Args:
+            coords, ndarray - len(coords.shape)==3
+            coord_idx, int - какую координату нужно отразить
+        Returns:
+            np.copy(coords), но соответствующая координата отражена
+    """
+    new_coords = np.copy(coords)
+    new_coords[:, :, coord_idx] = 1 - new_coords[:, :, coord_idx]
+    return new_coords   
 
 # splits
 def fraction_split(exercise2points:dict, exercise2errors:dict, train_frac:float, val_frac:float, test_frac:float, state=0):
