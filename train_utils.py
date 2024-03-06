@@ -1,8 +1,10 @@
 from dataproc import *
 import os
+import random
+import copy
+
 import torch
 import numpy as np
-import random
 
 def parse_annotations(file2mapping:dict, single_st_ann:str, annotations_map:dict, ss_vid_ann:list, single_student_tids:dict, file2exercise:dict):
     """ Парсит все ручные аннотации с ошибками и окончанием вместе с автоматически полученными аннотациями 
@@ -237,3 +239,122 @@ def stratify_split(exercise2points:dict, exercise2errors:dict, train_frac:float,
     #                                                   train_size=train_count, 
     #                                                   random_state=state, stratify=y_train)
     return [(X_train, y_train), (X_test, y_test), (X_val, y_val)]
+
+# splitting exercise tries
+
+def parse_borders_annotations(file2mapping:dict, single_st_ann:str, annotations_map:dict, ss_vid_ann:list, single_student_tids:dict):
+    """ Парсит ручные и автоматические аннотации в список ключевых точек с полной длительности видео и границ (начала и конца).
+        Args:
+            file2mapping, dict[str, dict[int, int]] - путь до файла с детектированными координатами к. точек (ключ) 
+                : словарь автоопределенных id при трекинге человека вручную проставленным id в аннотациях ошибок и границ упражнений (значение)
+            single_st_ann, str - путь до файла с аннотациями ошибок и границ упражнений видео с одним учеником
+            annotations_map, dict[str, str] - путь до json-файлов с координатами точек к пути до ручных аннотаций ошибок и границ упражнений
+            ss_vid_ann, list - список путей до json-файлов с координатами ключевых точек, полученных от видео с одним учеником
+            single_student_tids, dict[str, int] - номер из видео с одним человеком (ключ) к id от автотрекинга человека(значение)
+
+        file2mapping.keys()==annotations_map.keys()
+        Returns:
+            (student_exercise_points, exercise_borders)
+            student_exercise_points, list[np.ndarray] - список полных координат каждого студента,
+                форма каждого элемента: (26, длительность видео в кадрах, 3)
+            exercise_borders, list[list[list[int]]] - список списков индексов начальных и конечных кадров упражнения по студенту,
+                каждый элемент списка первого уровня имеет длину 2
+    """
+    #crowd
+    student_exercise_points = []
+    exercise_borders = []
+    for filename in file2mapping:
+        sid2kps = parse_crowd_exercise(filename, file2mapping[filename])    
+        with open(annotations_map[filename], "r", encoding="utf8") as ja:
+            ann = json.load(ja)
+        for sid in sid2kps:
+            exerc_arr = sid2kps[sid]
+            student_exercise_points.append(exerc_arr)
+            exercise_borders.append(ann["people_exercise_frames"][str(sid)])
+    #single student
+    with open(single_st_ann, "r", encoding="utf8") as common_ann_file:
+        common_ann = json.load(common_ann_file)
+    for filename in ss_vid_ann:
+        stud_id = os.path.split(filename)[-1][:4]
+        dynamic = parse_single_person_exercise(filename, single_student_tids[stud_id])
+        internal_vid_id = common_ann["file2id"][stud_id]
+        student_exercise_points.append(dynamic)
+        exercise_borders.append(common_ann["people_exercise_frames"][internal_vid_id])
+    return student_exercise_points, exercise_borders
+
+EXTOKENS = {"<NOT_EXERCISE>":0, "<START>":1, "<EXERCISE_BODY>":2, "<END>":3, "<END_START>":4, "<EDGE>":5}
+
+def encode_borders(students_borders:list, frame_durations:list, fill_exercise_token:str, equal_edges:bool=False, diff_borders_one_frame:str="move_start"):
+    """ Кодирует границы в вектор тегов длиной frame_durations.
+        Args:
+            students_borders, list[list[list[int]]] - список по ученику начальных и конечных кадров упражнений в общей записи
+            frame_durations, list[int] - список длительности записи по ученику
+            fill_exercise_token, str - чем заполнять промежуток между началом и концом упражнения; 
+                допускаются None, '<NOT_EXERCISE>', '<EXERCISE_BODY>'
+            equal_edges, bool - кодировать ли начало и конец одним значением, 
+                if True - ignore diff_borders_one_frame
+            diff_borders_one_frame, str - стратегия, если на одном кадре есть конец упражнения и начало следующего:
+                'move_start' - сдвигать только начало следующего упражнения на следующий кадр
+                'move_end' - сдвигать только конец текущего упражнения на предыдущий кадр
+                'token' - использовать специальный токен
+        Returns:
+            encoded_borders, list[np.ndarray] - список по ученику границ в виде вектора
+                len(encoded_borders)==len(students_borders)
+    """
+    if not fill_exercise_token:
+        fill_exercise_token = '<NOT_EXERCISE>'
+    assert fill_exercise_token=='<NOT_EXERCISE>' or fill_exercise_token=='<EXERCISE_BODY>'
+    assert diff_borders_one_frame=='move_start' or diff_borders_one_frame=='move_end' or diff_borders_one_frame=='token'
+    students_borders = copy.deepcopy(students_borders)
+    encoded_borders = []
+    for student, st_borders in enumerate(students_borders):
+        edges_container = np.full(frame_durations[student], EXTOKENS["<NOT_EXERCISE>"])
+        was_overlapping = False
+        for idx, borders in enumerate(st_borders):
+            end_frame_idx = min(borders[1], len(edges_container)-1)
+            if equal_edges:
+                edges_container[borders[0]] = EXTOKENS["<EDGE>"]
+                edges_container[end_frame_idx] = EXTOKENS["<EDGE>"]            
+            else:
+                # this exercise end is on same frame as the next exercise frame
+                is_overlapping = (idx + 1 < len(st_borders)) and (st_borders[idx + 1][0] == borders[1])
+                if diff_borders_one_frame == 'token':
+                    if not was_overlapping:
+                        edges_container[borders[0]] = EXTOKENS["<START>"]
+                    if is_overlapping:
+                        edges_container[end_frame_idx] = EXTOKENS["<END_START>"]
+                    else:
+                        edges_container[end_frame_idx] = EXTOKENS["<END>"]
+                else:
+                    if is_overlapping and (diff_borders_one_frame == 'move_start'):
+                        st_borders[idx + 1][0] += 1
+                    elif is_overlapping and (diff_borders_one_frame == 'move_end'):
+                        borders[1] -= 1
+                        end_frame_idx = min(borders[1], len(edges_container)-1)
+                    edges_container[borders[0]] = EXTOKENS["<START>"]
+                    edges_container[end_frame_idx] = EXTOKENS["<END>"]
+                was_overlapping = is_overlapping
+                # put start edge
+                # if diff_borders_one_frame != 'token':
+                #     edges_container[borders[0]] = EXTOKENS["<START>"]
+                #put end edge
+                # if idx + 1 < len(st_borders): # not last exercise, so check borders overlap
+                #     next_ex_borders = st_borders[idx + 1]
+                #     if next_ex_borders[0] == borders[1]: #frame overlap                
+                #         if diff_borders_one_frame == 'move_start':
+                #             next_ex_borders[0] += 1
+                #         elif diff_borders_one_frame == 'move_end':
+                #             borders[1] -= 1            
+                # edges_container[end_frame_idx] = EXTOKENS["<END>"]
+                # if diff_borders_one_frame == 'token':
+                #     edges_container[end_frame_idx] = EXTOKENS["<END_START>"]
+            # fill exercise frames    
+            edges_container[borders[0] + 1 : end_frame_idx] = EXTOKENS[fill_exercise_token]
+        encoded_borders.append(edges_container)
+    return encoded_borders
+
+
+
+
+
+

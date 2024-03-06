@@ -288,4 +288,56 @@ def resample_to_frame_length(keypoints:np.array, new_length:int)->np.array:
     picked_frame_idx = np.linspace(0, keypoints.shape[1] + 1, new_length, 
                                    endpoint=False, dtype=np.int64)    
     return np.copy(keypoints[:, picked_frame_idx, :])
-        
+
+def split_into_equal_frame_len(student_points:list, borders:list, piece_len:int, not_exercise_val:int=0, drop_last:bool=True):
+    """ Разделяет цельную длительность движений каждого ученика на куски одной длины.
+        Разбиение происходит по 2ой размерности (shape[1])
+        Args:
+            student_points, list[np.ndarray] - список массивов ключевых точек произвольной длительности (shape=(26, frame_len, 3 or 2)) 
+            borders, list[np.ndarray] - список 1d-массивов размеченных границ упражнений, может быть None
+                len(student_points) == len(borders)
+                student_points[n].shape[1] == len(borders[n]) (0 <= n < len(student_points))
+            piece_len, int - какой длины должны быть куски
+            not_exercise_val, int - тег для кадров, в которых не происходит упражнение
+            drop_last, bool - оставлять ли "хвосты", которые меньше длины piece_len, дополняя их паддингом            
+        Returns:
+            split_student_points, dict[int, list[np.ndarray]] - ключом является индекс в student_points (номер ученика), 
+                значением - список массивов точек одинаковой длины в кадрах
+            if borders != None: split_borders, dict[int, list[np.ndarray]] - keys()==split_student_points.keys(),
+                значение - список массивов размеченных границ
+    """
+    student2pieces = dict()
+    student2border_pieces = dict()
+    for sidx, points in enumerate(student_points):
+        if borders: 
+            cur_borders = borders[sidx]
+        dynamic_pieces = []
+        border_pieces = []
+        for start_idx in range(0, points.shape[1], piece_len):
+            if (start_idx + piece_len) >= points.shape[1]: # tail
+                if drop_last: break
+                else:
+                    padding_size = piece_len - (points.shape[1] - start_idx)
+                    # points
+                    pad = np.zeros((points.shape[0], padding_size, points.shape[-1]))
+                    dynamic_pieces.append(np.concatenate((points[:, start_idx:, :], pad), axis=1))
+                    # borders
+                    if borders: 
+                        border_pad = np.full(padding_size, not_exercise_val)
+                        border_pieces.append(np.concatenate((cur_borders[start_idx:], border_pad)))
+            else:
+                # points
+                points_piece = np.copy(points[:, start_idx:start_idx + piece_len, :])
+                dynamic_pieces.append(points_piece)
+                # borders
+                if borders: 
+                    border_piece = np.copy(cur_borders[start_idx:start_idx + piece_len])
+                    border_pieces.append(border_piece)
+        student2pieces[sidx] = dynamic_pieces
+        if borders: 
+            student2border_pieces[sidx] = border_pieces
+    if borders: 
+        return student2pieces, student2border_pieces
+    return student2pieces
+
+
