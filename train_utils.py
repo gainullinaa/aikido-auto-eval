@@ -139,6 +139,18 @@ def mirror_coordinate(coords:np.ndarray, coord_idx:int=0):
     new_coords[:, :, coord_idx] = 1 - new_coords[:, :, coord_idx]
     return new_coords   
 
+def batch_second_collate(batch):
+    """ Замена collate_fn для dataloader'ов, если обучается LSTM-модель с batch_first=False.
+    """
+    data = []
+    labels = []
+    for i, t in batch:
+        data.append(torch.tensor(i))
+        labels.append(torch.tensor(t))
+    stacked_data = torch.cat(data, 1)
+    stacked_labels = torch.stack(labels)
+    return stacked_data, stacked_labels
+
 # splits
 def fraction_split(exercise2points:dict, exercise2errors:dict, train_frac:float, val_frac:float, test_frac:float, state=0):
     random.seed(state)
